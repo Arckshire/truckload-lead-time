@@ -1,0 +1,6 @@
+# requirements.txt - TL Lead Time Optimization Tool
+streamlit>=1.36.0
+pandas>=2.2.0
+numpy>=1.26.0
+openpyxl>=3.1.2
+plotly>=5.22.0
