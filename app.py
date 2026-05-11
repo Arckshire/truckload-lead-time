@@ -225,10 +225,55 @@ def first_stop_index() -> int:
 # Datetime helpers
 # ============================================================
 def _coerce_datetimes(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+    """Coerce timestamp columns to naive datetime64.
+
+    The p44 unified shipment export emits timestamps formatted as
+    ``"2026-05-09 01:09:01 IST"`` with a literal three-letter timezone
+    abbreviation appended. ``pd.to_datetime`` with ``utc=True`` either rejects
+    the suffix (yielding NaT for every row, which produced the
+    "no eligible shipments" failure seen in production) or interprets ``IST``
+    via the deprecated tzlocal fallback, which silently depends on the
+    deployment host's timezone.
+
+    Since every timestamp in the export carries the same timezone, we strip the
+    trailing TZ abbreviation (or numeric offset) and parse the remainder as a
+    naive datetime. Time deltas between two naive timestamps from the same
+    source are identical to deltas computed in any consistent timezone, so
+    lead-time math is unaffected. This also handles cells that contain a
+    single space or other whitespace-only placeholders.
+    """
+    if df is None or len(df) == 0:
+        return df
+    # Regex strips: trailing whitespace + 2-5 letters (e.g. IST, UTC, EST,
+    # PDT, GMT) OR trailing whitespace + numeric offset (+0530, -08:00).
+    _TZ_SUFFIX_RE = r"\s+(?:[A-Za-z]{2,5}|[+-]\d{2}:?\d{2})\s*$"
     for c in cols:
-        if c in df.columns:
-            s = pd.to_datetime(df[c], errors="coerce", utc=True)
-            df[c] = s.dt.tz_convert(None)
+        if c not in df.columns:
+            continue
+        col = df[c]
+        # If already a datetime dtype, nothing to do.
+        if pd.api.types.is_datetime64_any_dtype(col):
+            # Drop any timezone info so downstream subtractions stay consistent.
+            if getattr(col.dtype, "tz", None) is not None:
+                df[c] = col.dt.tz_convert(None)
+            continue
+        # Coerce to string, treat NaN/None as empty, strip whitespace, drop
+        # the literal " IST"-style suffix, then parse as naive.
+        s = col.where(col.notna(), other="").astype(str).str.strip()
+        s = s.str.replace(_TZ_SUFFIX_RE, "", regex=True)
+        s = s.replace({"": None})
+        # Fast path: p44 exports use "YYYY-MM-DD HH:MM:SS" after the TZ strip.
+        # Try the explicit format first to avoid per-element dateutil fallback
+        # (which is very slow on 100k+ row uploads). If anything fails the
+        # fast path, fall back to the inferring parser for that column.
+        parsed = pd.to_datetime(s, format="%Y-%m-%d %H:%M:%S", errors="coerce")
+        nonnull_input = s.notna().sum()
+        nonnull_parsed = parsed.notna().sum()
+        if nonnull_input > 0 and nonnull_parsed < nonnull_input * 0.5:
+            # Less than half parsed under the fast format: fall back to the
+            # inferring parser so we still handle exotic formats correctly.
+            parsed = pd.to_datetime(s, errors="coerce")
+        df[c] = parsed
     return df
 
 
@@ -459,14 +504,25 @@ def compute_shipment_leadtimes(
     df["_END_TS"] = pd.to_datetime(df["_END_TS"], errors="coerce")
 
     # Default journey eligibility - just need both selected milestones present
+    rows_before = len(df)
+    start_present = int(df["_START_TS"].notna().sum())
+    end_present = int(df["_END_TS"].notna().sum())
     base_mask = df["_START_TS"].notna() & df["_END_TS"].notna()
     df = df[base_mask].copy()
 
     if df.empty:
-        return pd.DataFrame(columns=[
+        empty = pd.DataFrame(columns=[
             "TENANT_NAME", "MASTER_SHIPMENT_ID", "POL", "POD", "LANE",
             "CARRIER_NAME", "CARRIER_SCAC", "JOURNEY_LEAD_HOURS", "_LAST_IDX",
         ])
+        empty.attrs["diagnostics"] = {
+            "rows_with_lane": rows_before,
+            "rows_with_start_ts": start_present,
+            "rows_with_end_ts": end_present,
+            "start_milestone": start_ms,
+            "end_milestone": end_ms,
+        }
+        return empty
 
     if progress_cb:
         progress_cb("Computing journey lead times...", 0.50)
@@ -1291,10 +1347,30 @@ if whole_journey:
     )
 
 if eligible_shipments == 0:
-    st.warning(
-        "No shipments are eligible for the current settings. "
-        "Try toggling Whole Journey off, or pick a different start/end milestone pair."
+    diag = getattr(shipment_lt_all, "attrs", {}).get("diagnostics", {}) if shipment_lt_all is not None else {}
+    msg_lines = [
+        "No shipments are eligible for the current settings."
+    ]
+    if diag:
+        rows_with_lane = diag.get("rows_with_lane", 0)
+        rows_with_start = diag.get("rows_with_start_ts", 0)
+        rows_with_end = diag.get("rows_with_end_ts", 0)
+        sms = diag.get("start_milestone", start_ms)
+        ems = diag.get("end_milestone", end_ms)
+        msg_lines.append(
+            f"Rows with a valid lane: {rows_with_lane:,}. "
+            f"Rows with a usable start timestamp ({MILESTONE_LABELS.get(sms, sms)}): {rows_with_start:,}. "
+            f"Rows with a usable end timestamp ({MILESTONE_LABELS.get(ems, ems)}): {rows_with_end:,}."
+        )
+        if rows_with_lane > 0 and (rows_with_start == 0 or rows_with_end == 0):
+            msg_lines.append(
+                "It looks like the chosen milestone timestamps are missing for every row. "
+                "Try a different start/end milestone pair (e.g. Origin Arrival → Destination Arrival)."
+            )
+    msg_lines.append(
+        "If everything looks correct, try toggling Whole Journey off, or pick a different start/end milestone pair."
     )
+    st.warning(" ".join(msg_lines))
 
 # ----------- Counts -----------
 lane_counts, carrier_counts = compute_lane_and_carrier_counts(shipment_lt)
