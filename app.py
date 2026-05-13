@@ -1699,6 +1699,10 @@ report_df = build_carrier_lane_report(
     min_volume_for_percentile=0,
     duration_configs=duration_configs,
 )
+# Key glossary is needed by both the final-report builder and the insights
+# export. Build it once at module scope so the insights tab can reference it
+# even when the user hasn't yet clicked "Prepare final-report downloads".
+key_df = build_key_glossary(duration_configs, int(percentile_p))
 
 st.subheader("Carrier Lane Lead (preview)")
 preview_report = report_df.drop(columns=["_POL", "_POD", "_IS_LANE_ROW"], errors="ignore").head(25)
@@ -1754,7 +1758,6 @@ if st.session_state["final_export_key"] != _export_key:
 if not st.session_state["final_export_ready"]:
     if st.button("Prepare final-report downloads", type="primary"):
         with st.spinner("Building Excel + CSV ZIP. This can take a minute on large uploads..."):
-            key_df = build_key_glossary(duration_configs, int(percentile_p))
             xlsx_bytes = write_excel_final(
                 raw_df=raw_df, report_df=report_df,
                 duration_configs=duration_configs, percentile_p=int(percentile_p),
