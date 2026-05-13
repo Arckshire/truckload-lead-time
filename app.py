@@ -1301,6 +1301,143 @@ def write_insights_excel(
     return output.getvalue()
 
 
+def _safe_sheet_name(name: str, used: set, max_len: int = 31) -> str:
+    """Return a workbook-safe Excel sheet name, deduplicated against `used`.
+
+    Excel sheet names: max 31 chars, no : / \\ ? * [ ] characters."""
+    cleaned = re.sub(r"[:/\\\?\*\[\]]", " ", str(name)).strip()
+    if not cleaned:
+        cleaned = "Sheet"
+    candidate = cleaned[:max_len]
+    n = 2
+    while candidate.lower() in {u.lower() for u in used}:
+        suffix = f" ({n})"
+        candidate = (cleaned[: max_len - len(suffix)]) + suffix
+        n += 1
+    used.add(candidate)
+    return candidate
+
+
+def compute_all_insights(
+    shipment_lt: pd.DataFrame,
+    duration_configs: List[Dict[str, str]],
+    percentile_p: int,
+    percentile_threshold_enabled: bool,
+    percentile_threshold_pct: float,
+    rec_threshold_enabled: bool,
+    rec_threshold_pct: float,
+) -> List[Dict[str, object]]:
+    """Run compute_insights_for_metric for every metric in duration_configs.
+    Returns a list of dicts: { 'cfg': {...}, 'lane_summary': df, 'carrier_recs': df }.
+    """
+    out = []
+    for cfg in duration_configs:
+        lane_summary, carrier_recs = compute_insights_for_metric(
+            shipment_lt=shipment_lt,
+            metric_cfg=cfg,
+            percentile_p=percentile_p,
+            percentile_threshold_enabled=percentile_threshold_enabled,
+            percentile_threshold_pct=percentile_threshold_pct,
+            rec_threshold_enabled=rec_threshold_enabled,
+            rec_threshold_pct=rec_threshold_pct,
+        )
+        out.append({"cfg": cfg, "lane_summary": lane_summary, "carrier_recs": carrier_recs})
+    return out
+
+
+def write_all_insights_excel(
+    all_insights: List[Dict[str, object]],
+    key_df: pd.DataFrame,
+) -> bytes:
+    """Build a single Excel workbook with Lane + Carrier sheets per metric.
+
+    Sheet name format:
+        '<metric_label> - Lanes'      (max 31 chars, deduplicated)
+        '<metric_label> - Carriers'
+    Plus a single 'Index' sheet listing every metric -> sheet mapping, and a
+    final 'Key' sheet.
+    """
+    from openpyxl.styles import Font
+    from openpyxl.utils import get_column_letter
+
+    output = io.BytesIO()
+    used: set = set()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        # Reserve a placeholder for the Index sheet so it ends up first.
+        index_sheet_name = _safe_sheet_name("Index", used)
+        pd.DataFrame({"Metric": [], "Lanes Sheet": [], "Carriers Sheet": []}).to_excel(
+            writer, sheet_name=index_sheet_name, index=False
+        )
+
+        index_rows = []
+        for entry in all_insights:
+            cfg = entry["cfg"]
+            label = cfg["label"]
+            lanes_sheet = _safe_sheet_name(f"{label} - Lanes", used)
+            carriers_sheet = _safe_sheet_name(f"{label} - Carriers", used)
+            entry["lane_summary"].to_excel(writer, sheet_name=lanes_sheet, index=False)
+            entry["carrier_recs"].to_excel(writer, sheet_name=carriers_sheet, index=False)
+            index_rows.append({
+                "Metric": label,
+                "Lanes Sheet": lanes_sheet,
+                "Carriers Sheet": carriers_sheet,
+                "Lane Count": len(entry["lane_summary"]),
+                "Carrier Row Count": len(entry["carrier_recs"]),
+            })
+
+        # Overwrite the Index placeholder with the real index now that we have it.
+        index_df = pd.DataFrame(index_rows, columns=["Metric", "Lanes Sheet", "Carriers Sheet", "Lane Count", "Carrier Row Count"])
+        # Remove the placeholder Index sheet and re-add the real one at the front.
+        wb = writer.book
+        if index_sheet_name in wb.sheetnames:
+            del wb[index_sheet_name]
+        index_df.to_excel(writer, sheet_name=index_sheet_name, index=False)
+        wb.move_sheet(index_sheet_name, offset=-(len(wb.sheetnames) - 1))
+
+        key_sheet_name = _safe_sheet_name("Key", used)
+        key_df.to_excel(writer, sheet_name=key_sheet_name, index=False)
+
+        # Pretty formatting
+        for ws in writer.book.worksheets:
+            for cell in ws[1]:
+                cell.font = Font(bold=True)
+            for idx in range(1, ws.max_column + 1):
+                ws.column_dimensions[get_column_letter(idx)].width = 28
+    output.seek(0)
+    return output.getvalue()
+
+
+def write_all_insights_csv_zip(
+    all_insights: List[Dict[str, object]],
+    key_df: pd.DataFrame,
+) -> bytes:
+    """Build a ZIP containing one Lane CSV + one Carrier CSV per metric, plus
+    key.csv and an index.csv mapping metric -> filenames."""
+    output = io.BytesIO()
+    index_rows = []
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as zf:
+        for entry in all_insights:
+            cfg = entry["cfg"]
+            label = cfg["label"]
+            safe = re.sub(r"[^A-Za-z0-9._-]+", "_", label).strip("_") or "metric"
+            lanes_name = f"{safe}__lane_summary.csv"
+            carriers_name = f"{safe}__carrier_recommendations.csv"
+            zf.writestr(lanes_name, entry["lane_summary"].to_csv(index=False).encode("utf-8"))
+            zf.writestr(carriers_name, entry["carrier_recs"].to_csv(index=False).encode("utf-8"))
+            index_rows.append({
+                "Metric": label,
+                "Lanes CSV": lanes_name,
+                "Carriers CSV": carriers_name,
+                "Lane Count": len(entry["lane_summary"]),
+                "Carrier Row Count": len(entry["carrier_recs"]),
+            })
+        index_df = pd.DataFrame(index_rows, columns=["Metric", "Lanes CSV", "Carriers CSV", "Lane Count", "Carrier Row Count"])
+        zf.writestr("index.csv", index_df.to_csv(index=False).encode("utf-8"))
+        zf.writestr("key.csv", key_df.to_csv(index=False).encode("utf-8"))
+    output.seek(0)
+    return output.getvalue()
+
+
 def build_export_rename_map(duration_configs: List[Dict[str, str]], percentile_p: int) -> Dict[str, str]:
     export_cols = {
         "TENANT_NAME": DISPLAY_COLS["TENANT_NAME"],
@@ -1957,3 +2094,62 @@ if st.session_state["show_insights"]:
                 file_name=f"tl_insights_{safe_metric_label}.zip",
                 mime="application/zip",
             )
+
+    # ---- Bulk insights export (every metric pair in one download) ----
+    st.markdown("---")
+    st.markdown("### Download insights for ALL metric pairs at once")
+    st.caption(
+        "Builds one workbook (and/or one CSV ZIP) containing the Lane Summary + "
+        "Carrier Recommendations for every metric in the dropdown above. "
+        "Sidebar settings (P-value, recommendation thresholds) apply to all metrics."
+    )
+
+    if "bulk_insights_ready" not in st.session_state:
+        st.session_state["bulk_insights_ready"] = False
+        st.session_state["bulk_insights_xlsx"] = None
+        st.session_state["bulk_insights_zip"] = None
+        st.session_state["bulk_insights_metric_count"] = 0
+
+    if not st.session_state["bulk_insights_ready"]:
+        if st.button("Prepare bulk insights export"):
+            with st.spinner(
+                f"Computing insights for all {len(duration_configs)} metric(s)..."
+            ):
+                all_insights = compute_all_insights(
+                    shipment_lt=shipment_lt,
+                    duration_configs=duration_configs,
+                    percentile_p=int(percentile_p),
+                    percentile_threshold_enabled=bool(include_percentile and limit_by_volume),
+                    percentile_threshold_pct=float(percentile_volume_threshold_pct),
+                    rec_threshold_enabled=bool(recommendation_threshold_enabled),
+                    rec_threshold_pct=float(recommendation_threshold_pct),
+                )
+                bulk_xlsx = write_all_insights_excel(all_insights, key_df)
+                bulk_zip = write_all_insights_csv_zip(all_insights, key_df)
+                st.session_state["bulk_insights_xlsx"] = bulk_xlsx
+                st.session_state["bulk_insights_zip"] = bulk_zip
+                st.session_state["bulk_insights_metric_count"] = len(all_insights)
+                st.session_state["bulk_insights_ready"] = True
+            st.rerun()
+    else:
+        st.success(
+            f"Bulk insights ready: {st.session_state['bulk_insights_metric_count']} metric(s) included."
+        )
+        bie1, bie2 = st.columns(2)
+        bie1.download_button(
+            label="Download ALL Insights (Excel)",
+            data=st.session_state["bulk_insights_xlsx"],
+            file_name="tl_insights_all_metrics.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        bie2.download_button(
+            label="Download ALL Insights (CSV Zip)",
+            data=st.session_state["bulk_insights_zip"],
+            file_name="tl_insights_all_metrics.zip",
+            mime="application/zip",
+        )
+        if st.button("Rebuild bulk insights export"):
+            st.session_state["bulk_insights_ready"] = False
+            st.session_state["bulk_insights_xlsx"] = None
+            st.session_state["bulk_insights_zip"] = None
+            st.rerun()
